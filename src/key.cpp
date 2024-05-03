@@ -15,6 +15,8 @@
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_recovery.h>
 #include <secp256k1_schnorrsig.h>
+#include <sphincsplus.h>
+#include <shake-a64.h>
 
 static secp256k1_context* secp256k1_context_sign = nullptr;
 
@@ -216,244 +218,244 @@ bool CKey::Sign(const uint256 &hash, std::vector<unsigned char>& vchSig, bool gr
         return false;
     vchSig.resize(CPubKey::SIGNATURE_SIZE);
     size_t nSigLen = CPubKey::SIGNATURE_SIZE;
-    unsigned char extra_entropy[32] = {0};
-    WriteLE32(extra_entropy, test_case);
-    secp256k1_ecdsa_signature sig;
-    uint32_t counter = 0;
-    int ret = secp256k1_ecdsa_sign(secp256k1_context_sign, &sig, hash.begin(), UCharCast(begin()), secp256k1_nonce_function_rfc6979, (!grind && test_case) ? extra_entropy : nullptr);
+        unsigned char extra_entropy[32] = {0};
+        WriteLE32(extra_entropy, test_case);
+        sphincsplus_signature sig;
+        uint32_t counter = 0;
+        int ret = sphincsplus_sign(sphincsplus_context_sign, &sig, hash.begin(), UCharCast(begin()), sphincsplus_nonce_function_rfc6979, (!grind && test_case) ? extra_entropy : nullptr);
 
-    // Grind for low R
-    while (ret && !SigHasLowR(&sig) && grind) {
-        WriteLE32(extra_entropy, ++counter);
-        ret = secp256k1_ecdsa_sign(secp256k1_context_sign, &sig, hash.begin(), UCharCast(begin()), secp256k1_nonce_function_rfc6979, extra_entropy);
-    }
-    assert(ret);
-    secp256k1_ecdsa_signature_serialize_der(secp256k1_context_sign, vchSig.data(), &nSigLen, &sig);
-    vchSig.resize(nSigLen);
-    // Additional verification step to prevent using a potentially corrupted signature
-    secp256k1_pubkey pk;
-    ret = secp256k1_ec_pubkey_create(secp256k1_context_sign, &pk, UCharCast(begin()));
-    assert(ret);
-    ret = secp256k1_ecdsa_verify(secp256k1_context_static, &sig, hash.begin(), &pk);
-    assert(ret);
-    return true;
-}
-
-bool CKey::VerifyPubKey(const CPubKey& pubkey) const {
-    if (pubkey.IsCompressed() != fCompressed) {
-        return false;
-    }
-    unsigned char rnd[8];
-    std::string str = "Bitcoin key verification\n";
-    GetRandBytes(rnd);
-    uint256 hash{Hash(str, rnd)};
-    std::vector<unsigned char> vchSig;
-    Sign(hash, vchSig);
-    return pubkey.Verify(hash, vchSig);
-}
-
-bool CKey::SignCompact(const uint256 &hash, std::vector<unsigned char>& vchSig) const {
-    if (!keydata)
-        return false;
-    vchSig.resize(CPubKey::COMPACT_SIGNATURE_SIZE);
-    int rec = -1;
-    secp256k1_ecdsa_recoverable_signature rsig;
-    int ret = secp256k1_ecdsa_sign_recoverable(secp256k1_context_sign, &rsig, hash.begin(), UCharCast(begin()), secp256k1_nonce_function_rfc6979, nullptr);
-    assert(ret);
-    ret = secp256k1_ecdsa_recoverable_signature_serialize_compact(secp256k1_context_sign, &vchSig[1], &rec, &rsig);
-    assert(ret);
-    assert(rec != -1);
-    vchSig[0] = 27 + rec + (fCompressed ? 4 : 0);
-    // Additional verification step to prevent using a potentially corrupted signature
-    secp256k1_pubkey epk, rpk;
-    ret = secp256k1_ec_pubkey_create(secp256k1_context_sign, &epk, UCharCast(begin()));
-    assert(ret);
-    ret = secp256k1_ecdsa_recover(secp256k1_context_static, &rpk, &rsig, hash.begin());
-    assert(ret);
-    ret = secp256k1_ec_pubkey_cmp(secp256k1_context_static, &epk, &rpk);
-    assert(ret == 0);
-    return true;
-}
-
-bool CKey::SignSchnorr(const uint256& hash, Span<unsigned char> sig, const uint256* merkle_root, const uint256& aux) const
-{
-    assert(sig.size() == 64);
-    secp256k1_keypair keypair;
-    if (!secp256k1_keypair_create(secp256k1_context_sign, &keypair, UCharCast(begin()))) return false;
-    if (merkle_root) {
-        secp256k1_xonly_pubkey pubkey;
-        if (!secp256k1_keypair_xonly_pub(secp256k1_context_sign, &pubkey, nullptr, &keypair)) return false;
-        unsigned char pubkey_bytes[32];
-        if (!secp256k1_xonly_pubkey_serialize(secp256k1_context_sign, pubkey_bytes, &pubkey)) return false;
-        uint256 tweak = XOnlyPubKey(pubkey_bytes).ComputeTapTweakHash(merkle_root->IsNull() ? nullptr : merkle_root);
-        if (!secp256k1_keypair_xonly_tweak_add(secp256k1_context_static, &keypair, tweak.data())) return false;
-    }
-    bool ret = secp256k1_schnorrsig_sign32(secp256k1_context_sign, sig.data(), hash.data(), &keypair, aux.data());
-    if (ret) {
-        // Additional verification step to prevent using a potentially corrupted signature
-        secp256k1_xonly_pubkey pubkey_verify;
-        ret = secp256k1_keypair_xonly_pub(secp256k1_context_static, &pubkey_verify, nullptr, &keypair);
-        ret &= secp256k1_schnorrsig_verify(secp256k1_context_static, sig.data(), hash.begin(), 32, &pubkey_verify);
-    }
-    if (!ret) memory_cleanse(sig.data(), sig.size());
-    memory_cleanse(&keypair, sizeof(keypair));
-    return ret;
-}
-
-bool CKey::Load(const CPrivKey &seckey, const CPubKey &vchPubKey, bool fSkipCheck=false) {
-    MakeKeyData();
-    if (!ec_seckey_import_der(secp256k1_context_sign, (unsigned char*)begin(), seckey.data(), seckey.size())) {
-        ClearKeyData();
-        return false;
-    }
-    fCompressed = vchPubKey.IsCompressed();
-
-    if (fSkipCheck)
-        return true;
-
-    return VerifyPubKey(vchPubKey);
-}
-
-bool CKey::Derive(CKey& keyChild, ChainCode &ccChild, unsigned int nChild, const ChainCode& cc) const {
-    assert(IsValid());
-    assert(IsCompressed());
-    std::vector<unsigned char, secure_allocator<unsigned char>> vout(64);
-    if ((nChild >> 31) == 0) {
-        CPubKey pubkey = GetPubKey();
-        assert(pubkey.size() == CPubKey::COMPRESSED_SIZE);
-        BIP32Hash(cc, nChild, *pubkey.begin(), pubkey.begin()+1, vout.data());
-    } else {
-        assert(size() == 32);
-        BIP32Hash(cc, nChild, 0, UCharCast(begin()), vout.data());
-    }
-    memcpy(ccChild.begin(), vout.data()+32, 32);
-    keyChild.Set(begin(), begin() + 32, true);
-    bool ret = secp256k1_ec_seckey_tweak_add(secp256k1_context_sign, (unsigned char*)keyChild.begin(), vout.data());
-    if (!ret) keyChild.ClearKeyData();
-    return ret;
-}
-
-EllSwiftPubKey CKey::EllSwiftCreate(Span<const std::byte> ent32) const
-{
-    assert(keydata);
-    assert(ent32.size() == 32);
-    std::array<std::byte, EllSwiftPubKey::size()> encoded_pubkey;
-
-    auto success = secp256k1_ellswift_create(secp256k1_context_sign,
-                                             UCharCast(encoded_pubkey.data()),
-                                             keydata->data(),
-                                             UCharCast(ent32.data()));
-
-    // Should always succeed for valid keys (asserted above).
-    assert(success);
-    return {encoded_pubkey};
-}
-
-ECDHSecret CKey::ComputeBIP324ECDHSecret(const EllSwiftPubKey& their_ellswift, const EllSwiftPubKey& our_ellswift, bool initiating) const
-{
-    assert(keydata);
-
-    ECDHSecret output;
-    // BIP324 uses the initiator as party A, and the responder as party B. Remap the inputs
-    // accordingly:
-    bool success = secp256k1_ellswift_xdh(secp256k1_context_sign,
-                                          UCharCast(output.data()),
-                                          UCharCast(initiating ? our_ellswift.data() : their_ellswift.data()),
-                                          UCharCast(initiating ? their_ellswift.data() : our_ellswift.data()),
-                                          keydata->data(),
-                                          initiating ? 0 : 1,
-                                          secp256k1_ellswift_xdh_hash_function_bip324,
-                                          nullptr);
-    // Should always succeed for valid keys (assert above).
-    assert(success);
-    return output;
-}
-
-CKey GenerateRandomKey(bool compressed) noexcept
-{
-    CKey key;
-    key.MakeNewKey(/*fCompressed=*/compressed);
-    return key;
-}
-
-bool CExtKey::Derive(CExtKey &out, unsigned int _nChild) const {
-    if (nDepth == std::numeric_limits<unsigned char>::max()) return false;
-    out.nDepth = nDepth + 1;
-    CKeyID id = key.GetPubKey().GetID();
-    memcpy(out.vchFingerprint, &id, 4);
-    out.nChild = _nChild;
-    return key.Derive(out.key, out.chaincode, _nChild, chaincode);
-}
-
-void CExtKey::SetSeed(Span<const std::byte> seed)
-{
-    static const unsigned char hashkey[] = {'B','i','t','c','o','i','n',' ','s','e','e','d'};
-    std::vector<unsigned char, secure_allocator<unsigned char>> vout(64);
-    CHMAC_SHA512{hashkey, sizeof(hashkey)}.Write(UCharCast(seed.data()), seed.size()).Finalize(vout.data());
-    key.Set(vout.data(), vout.data() + 32, true);
-    memcpy(chaincode.begin(), vout.data() + 32, 32);
-    nDepth = 0;
-    nChild = 0;
-    memset(vchFingerprint, 0, sizeof(vchFingerprint));
-}
-
-CExtPubKey CExtKey::Neuter() const {
-    CExtPubKey ret;
-    ret.nDepth = nDepth;
-    memcpy(ret.vchFingerprint, vchFingerprint, 4);
-    ret.nChild = nChild;
-    ret.pubkey = key.GetPubKey();
-    ret.chaincode = chaincode;
-    return ret;
-}
-
-void CExtKey::Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const {
-    code[0] = nDepth;
-    memcpy(code+1, vchFingerprint, 4);
-    WriteBE32(code+5, nChild);
-    memcpy(code+9, chaincode.begin(), 32);
-    code[41] = 0;
-    assert(key.size() == 32);
-    memcpy(code+42, key.begin(), 32);
-}
-
-void CExtKey::Decode(const unsigned char code[BIP32_EXTKEY_SIZE]) {
-    nDepth = code[0];
-    memcpy(vchFingerprint, code+1, 4);
-    nChild = ReadBE32(code+5);
-    memcpy(chaincode.begin(), code+9, 32);
-    key.Set(code+42, code+BIP32_EXTKEY_SIZE, true);
-    if ((nDepth == 0 && (nChild != 0 || ReadLE32(vchFingerprint) != 0)) || code[41] != 0) key = CKey();
-}
-
-bool ECC_InitSanityCheck() {
-    CKey key = GenerateRandomKey();
-    CPubKey pubkey = key.GetPubKey();
-    return key.VerifyPubKey(pubkey);
-}
-
-void ECC_Start() {
-    assert(secp256k1_context_sign == nullptr);
-
-    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-    assert(ctx != nullptr);
-
-    {
-        // Pass in a random blinding seed to the secp256k1 context.
-        std::vector<unsigned char, secure_allocator<unsigned char>> vseed(32);
-        GetRandBytes(vseed);
-        bool ret = secp256k1_context_randomize(ctx, vseed.data());
+        // Grind for low R
+        while (ret && !SigHasLowR(&sig) && grind) {
+            WriteLE32(extra_entropy, ++counter);
+            ret = sphincsplus_sign(sphincsplus_context_sign, &sig, hash.begin(), UCharCast(begin()), sphincsplus_nonce_function_rfc6979, extra_entropy);
+        }
         assert(ret);
+        sphincsplus_signature_serialize_der(sphincsplus_context_sign, vchSig.data(), &nSigLen, &sig);
+        vchSig.resize(nSigLen);
+        // Additional verification step to prevent using a potentially corrupted signature
+        sphincsplus_pubkey pk;
+        ret = sphincsplus_pubkey_create(sphincsplus_context_sign, &pk, UCharCast(begin()));
+        assert(ret);
+        ret = sphincsplus_verify(sphincsplus_context_static, &sig, hash.begin(), &pk);
+        assert(ret);
+        return true;
     }
 
-    secp256k1_context_sign = ctx;
-}
-
-void ECC_Stop() {
-    secp256k1_context *ctx = secp256k1_context_sign;
-    secp256k1_context_sign = nullptr;
-
-    if (ctx) {
-        secp256k1_context_destroy(ctx);
+    bool CKey::VerifyPubKey(const CPubKey& pubkey) const {
+        if (pubkey.IsCompressed() != fCompressed) {
+            return false;
+        }
+        unsigned char rnd[8];
+        std::string str = "Bitcoin key verification\n";
+        GetRandBytes(rnd);
+        uint256 hash{Hash(str, rnd)};
+        std::vector<unsigned char> vchSig;
+        Sign(hash, vchSig);
+        return pubkey.Verify(hash, vchSig);
     }
-}
+
+    bool CKey::SignCompact(const uint256 &hash, std::vector<unsigned char>& vchSig) const {
+        if (!keydata)
+            return false;
+        vchSig.resize(CPubKey::COMPACT_SIGNATURE_SIZE);
+        int rec = -1;
+        sphincsplus_recoverable_signature rsig;
+        int ret = sphincsplus_sign_recoverable(sphincsplus_context_sign, &rsig, hash.begin(), UCharCast(begin()), sphincsplus_nonce_function_rfc6979, nullptr);
+        assert(ret);
+        ret = sphincsplus_recoverable_signature_serialize_compact(sphincsplus_context_sign, &vchSig[1], &rec, &rsig);
+        assert(ret);
+        assert(rec != -1);
+        vchSig[0] = 27 + rec + (fCompressed ? 4 : 0);
+        // Additional verification step to prevent using a potentially corrupted signature
+        sphincsplus_pubkey epk, rpk;
+        ret = sphincsplus_pubkey_create(sphincsplus_context_sign, &epk, UCharCast(begin()));
+        assert(ret);
+        ret = sphincsplus_recover(sphincsplus_context_static, &rpk, &rsig, hash.begin());
+        assert(ret);
+        ret = sphincsplus_pubkey_cmp(sphincsplus_context_static, &epk, &rpk);
+        assert(ret == 0);
+        return true;
+    }
+
+    bool CKey::SignSchnorr(const uint256& hash, Span<unsigned char> sig, const uint256* merkle_root, const uint256& aux) const
+    {
+        assert(sig.size() == 64);
+        sphincsplus_keypair keypair;
+        if (!sphincsplus_keypair_create(sphincsplus_context_sign, &keypair, UCharCast(begin()))) return false;
+        if (merkle_root) {
+            sphincsplus_xonly_pubkey pubkey;
+            if (!sphincsplus_keypair_xonly_pub(sphincsplus_context_sign, &pubkey, nullptr, &keypair)) return false;
+            unsigned char pubkey_bytes[32];
+            if (!sphincsplus_xonly_pubkey_serialize(sphincsplus_context_sign, pubkey_bytes, &pubkey)) return false;
+            uint256 tweak = XOnlyPubKey(pubkey_bytes).ComputeTapTweakHash(merkle_root->IsNull() ? nullptr : merkle_root);
+            if (!sphincsplus_keypair_xonly_tweak_add(sphincsplus_context_static, &keypair, tweak.data())) return false;
+        }
+        bool ret = sphincsplus_schnorrsig_sign32(sphincsplus_context_sign, sig.data(), hash.data(), &keypair, aux.data());
+        if (ret) {
+            // Additional verification step to prevent using a potentially corrupted signature
+            sphincsplus_xonly_pubkey pubkey_verify;
+            ret = sphincsplus_keypair_xonly_pub(sphincsplus_context_static, &pubkey_verify, nullptr, &keypair);
+            ret &= sphincsplus_schnorrsig_verify(sphincsplus_context_static, sig.data(), hash.begin(), 32, &pubkey_verify);
+        }
+        if (!ret) memory_cleanse(sig.data(), sig.size());
+        memory_cleanse(&keypair, sizeof(keypair));
+        return ret;
+    }
+
+    bool CKey::Load(const CPrivKey &seckey, const CPubKey &vchPubKey, bool fSkipCheck=false) {
+        MakeKeyData();
+        if (!ec_seckey_import_der(sphincsplus_context_sign, (unsigned char*)begin(), seckey.data(), seckey.size())) {
+            ClearKeyData();
+            return false;
+        }
+        fCompressed = vchPubKey.IsCompressed();
+
+        if (fSkipCheck)
+            return true;
+
+        return VerifyPubKey(vchPubKey);
+    }
+
+    bool CKey::Derive(CKey& keyChild, ChainCode &ccChild, unsigned int nChild, const ChainCode& cc) const {
+        assert(IsValid());
+        assert(IsCompressed());
+        std::vector<unsigned char, secure_allocator<unsigned char>> vout(64);
+        if ((nChild >> 31) == 0) {
+            CPubKey pubkey = GetPubKey();
+            assert(pubkey.size() == CPubKey::COMPRESSED_SIZE);
+            BIP32Hash(cc, nChild, *pubkey.begin(), pubkey.begin()+1, vout.data());
+        } else {
+            assert(size() == 32);
+            BIP32Hash(cc, nChild, 0, UCharCast(begin()), vout.data());
+        }
+        memcpy(ccChild.begin(), vout.data()+32, 32);
+        keyChild.Set(begin(), begin() + 32, true);
+        bool ret = sphincsplus_ec_seckey_tweak_add(sphincsplus_context_sign, (unsigned char*)keyChild.begin(), vout.data());
+        if (!ret) keyChild.ClearKeyData();
+        return ret;
+    }
+
+    EllSwiftPubKey CKey::EllSwiftCreate(Span<const std::byte> ent32) const
+    {
+        assert(keydata);
+        assert(ent32.size() == 32);
+        std::array<std::byte, EllSwiftPubKey::size()> encoded_pubkey;
+
+        auto success = sphincsplus_ellswift_create(sphincsplus_context_sign,
+                                                 UCharCast(encoded_pubkey.data()),
+                                                 keydata->data(),
+                                                 UCharCast(ent32.data()));
+
+        // Should always succeed for valid keys (asserted above).
+        assert(success);
+        return {encoded_pubkey};
+    }
+
+    ECDHSecret CKey::ComputeBIP324ECDHSecret(const EllSwiftPubKey& their_ellswift, const EllSwiftPubKey& our_ellswift, bool initiating) const
+    {
+        assert(keydata);
+
+        ECDHSecret output;
+        // BIP324 uses the initiator as party A, and the responder as party B. Remap the inputs
+        // accordingly:
+        bool success = sphincsplus_ellswift_xdh(sphincsplus_context_sign,
+                                              UCharCast(output.data()),
+                                              UCharCast(initiating ? our_ellswift.data() : their_ellswift.data()),
+                                              UCharCast(initiating ? their_ellswift.data() : our_ellswift.data()),
+                                              keydata->data(),
+                                              initiating ? 0 : 1,
+                                              sphincsplus_ellswift_xdh_hash_function_bip324,
+                                              nullptr);
+        // Should always succeed for valid keys (assert above).
+        assert(success);
+        return output;
+    }
+
+    CKey GenerateRandomKey(bool compressed) noexcept
+    {
+        CKey key;
+        key.MakeNewKey(/*fCompressed=*/compressed);
+        return key;
+    }
+
+    bool CExtKey::Derive(CExtKey &out, unsigned int _nChild) const {
+        if (nDepth == std::numeric_limits<unsigned char>::max()) return false;
+        out.nDepth = nDepth + 1;
+        CKeyID id = key.GetPubKey().GetID();
+        memcpy(out.vchFingerprint, &id, 4);
+        out.nChild = _nChild;
+        return key.Derive(out.key, out.chaincode, _nChild, chaincode);
+    }
+
+    void CExtKey::SetSeed(Span<const std::byte> seed)
+    {
+        static const unsigned char hashkey[] = {'B','i','t','c','o','i','n',' ','s','e','e','d'};
+        std::vector<unsigned char, secure_allocator<unsigned char>> vout(64);
+        CHMAC_SHA512{hashkey, sizeof(hashkey)}.Write(UCharCast(seed.data()), seed.size()).Finalize(vout.data());
+        key.Set(vout.data(), vout.data() + 32, true);
+        memcpy(chaincode.begin(), vout.data() + 32, 32);
+        nDepth = 0;
+        nChild = 0;
+        memset(vchFingerprint, 0, sizeof(vchFingerprint));
+    }
+
+    CExtPubKey CExtKey::Neuter() const {
+        CExtPubKey ret;
+        ret.nDepth = nDepth;
+        memcpy(ret.vchFingerprint, vchFingerprint, 4);
+        ret.nChild = nChild;
+        ret.pubkey = key.GetPubKey();
+        ret.chaincode = chaincode;
+        return ret;
+    }
+
+    void CExtKey::Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const {
+        code[0] = nDepth;
+        memcpy(code+1, vchFingerprint, 4);
+        WriteBE32(code+5, nChild);
+        memcpy(code+9, chaincode.begin(), 32);
+        code[41] = 0;
+        assert(key.size() == 32);
+        memcpy(code+42, key.begin(), 32);
+    }
+
+    void CExtKey::Decode(const unsigned char code[BIP32_EXTKEY_SIZE]) {
+        nDepth = code[0];
+        memcpy(vchFingerprint, code+1, 4);
+        nChild = ReadBE32(code+5);
+        memcpy(chaincode.begin(), code+9, 32);
+        key.Set(code+42, code+BIP32_EXTKEY_SIZE, true);
+        if ((nDepth == 0 && (nChild != 0 || ReadLE32(vchFingerprint) != 0)) || code[41] != 0) key = CKey();
+    }
+
+    bool ECC_InitSanityCheck() {
+        CKey key = GenerateRandomKey();
+        CPubKey pubkey = key.GetPubKey();
+        return key.VerifyPubKey(pubkey);
+    }
+
+    void ECC_Start() {
+        assert(sphincsplus_context_sign == nullptr);
+
+        sphincsplus_context *ctx = sphincsplus_context_create(SPHINCSPLUS_CONTEXT_NONE);
+        assert(ctx != nullptr);
+
+        {
+            // Pass in a random blinding seed to the sphincsplus context.
+            std::vector<unsigned char, secure_allocator<unsigned char>> vseed(32);
+            GetRandBytes(vseed);
+            bool ret = sphincsplus_context_randomize(ctx, vseed.data());
+            assert(ret);
+        }
+
+        sphincsplus_context_sign = ctx;
+    }
+
+    void ECC_Stop() {
+        sphincsplus_context *ctx = sphincsplus_context_sign;
+        sphincsplus_context_sign = nullptr;
+
+        if (ctx) {
+            sphincsplus_context_destroy(ctx);
+        }
+    }
